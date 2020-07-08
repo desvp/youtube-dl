@@ -1,10 +1,13 @@
 from __future__ import unicode_literals
 
+import re
+
 from .common import InfoExtractor
 from ..utils import (
     ExtractorError,
     int_or_none,
     float_or_none,
+    url_or_none,
 )
 
 
@@ -13,7 +16,7 @@ class RedditIE(InfoExtractor):
     _TEST = {
         # from https://www.reddit.com/r/videos/comments/6rrwyj/that_small_heart_attack/
         'url': 'https://v.redd.it/zv89llsvexdz',
-        'md5': '655d06ace653ea3b87bccfb1b27ec99d',
+        'md5': '0a070c53eba7ec4534d95a5a1259e253',
         'info_dict': {
             'id': 'zv89llsvexdz',
             'ext': 'mp4',
@@ -35,6 +38,8 @@ class RedditIE(InfoExtractor):
             'https://v.redd.it/%s/DASHPlaylist.mpd' % video_id, video_id,
             mpd_id='dash', fatal=False))
 
+        self._sort_formats(formats)
+
         return {
             'id': video_id,
             'title': video_id,
@@ -43,7 +48,7 @@ class RedditIE(InfoExtractor):
 
 
 class RedditRIE(InfoExtractor):
-    _VALID_URL = r'https?://(?:www\.)?reddit\.com/r/[^/]+/comments/(?P<id>[^/]+)'
+    _VALID_URL = r'(?P<url>https?://(?:[^/]+\.)?reddit\.com/r/[^/]+/comments/(?P<id>[^/?#&]+))'
     _TESTS = [{
         'url': 'https://www.reddit.com/r/videos/comments/6rrwyj/that_small_heart_attack/',
         'info_dict': {
@@ -71,6 +76,10 @@ class RedditRIE(InfoExtractor):
         'url': 'https://www.reddit.com/r/MadeMeSmile/comments/6t7wi5/wait_for_it/',
         'only_matching': True,
     }, {
+        # imgur @ old reddit
+        'url': 'https://old.reddit.com/r/MadeMeSmile/comments/6t7wi5/wait_for_it/',
+        'only_matching': True,
+    }, {
         # streamable
         'url': 'https://www.reddit.com/r/videos/comments/6t7sg9/comedians_hilarious_joke_about_the_guam_flag/',
         'only_matching': True,
@@ -78,13 +87,20 @@ class RedditRIE(InfoExtractor):
         # youtube
         'url': 'https://www.reddit.com/r/videos/comments/6t75wq/southern_man_tries_to_speak_without_an_accent/',
         'only_matching': True,
+    }, {
+        # reddit video @ nm reddit
+        'url': 'https://nm.reddit.com/r/Cricket/comments/8idvby/lousy_cameraman_finds_himself_in_cairns_line_of/',
+        'only_matching': True,
     }]
 
     def _real_extract(self, url):
+        mobj = re.match(self._VALID_URL, url)
+        url, video_id = mobj.group('url', 'id')
+
         video_id = self._match_id(url)
 
         data = self._download_json(
-            url + '.json', video_id)[0]['data']['children'][0]['data']
+            url + '/.json', video_id)[0]['data']['children'][0]['data']
 
         video_url = data['url']
 
@@ -104,7 +120,7 @@ class RedditRIE(InfoExtractor):
             '_type': 'url_transparent',
             'url': video_url,
             'title': data.get('title'),
-            'thumbnail': data.get('thumbnail'),
+            'thumbnail': url_or_none(data.get('thumbnail')),
             'timestamp': float_or_none(data.get('created_utc')),
             'uploader': data.get('author'),
             'like_count': int_or_none(data.get('ups')),

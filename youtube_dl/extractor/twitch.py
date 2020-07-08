@@ -4,10 +4,11 @@ from __future__ import unicode_literals
 import itertools
 import re
 import random
+import json
 
 from .common import InfoExtractor
 from ..compat import (
-    compat_HTTPError,
+    compat_kwargs,
     compat_parse_qs,
     compat_str,
     compat_urllib_parse_urlencode,
@@ -17,23 +18,27 @@ from ..utils import (
     clean_html,
     ExtractorError,
     int_or_none,
-    js_to_json,
     orderedSet,
     parse_duration,
     parse_iso8601,
+    qualities,
+    str_or_none,
+    try_get,
+    unified_timestamp,
     update_url_query,
-    urlencode_postdata,
+    url_or_none,
     urljoin,
 )
 
 
 class TwitchBaseIE(InfoExtractor):
-    _VALID_URL_BASE = r'https?://(?:(?:www|go)\.)?twitch\.tv'
+    _VALID_URL_BASE = r'https?://(?:(?:www|go|m)\.)?twitch\.tv'
 
     _API_BASE = 'https://api.twitch.tv'
     _USHER_BASE = 'https://usher.ttvnw.net'
-    _LOGIN_URL = 'https://www.twitch.tv/login'
-    _CLIENT_ID = 'jzkbprff40iqj646a697cyrvl0zt2m6'
+    _LOGIN_FORM_URL = 'https://www.twitch.tv/login'
+    _LOGIN_POST_URL = 'https://passport.twitch.tv/login'
+    _CLIENT_ID = 'kimne78kx3ncx6brgo4mv6wki5h1ko'
     _NETRC_MACHINE = 'twitch'
 
     def _handle_error(self, response):
@@ -45,10 +50,19 @@ class TwitchBaseIE(InfoExtractor):
                 '%s returned error: %s - %s' % (self.IE_NAME, error, response.get('message')),
                 expected=True)
 
-    def _call_api(self, path, item_id, note):
+    def _call_api(self, path, item_id, *args, **kwargs):
+        headers = kwargs.get('headers', {}).copy()
+        headers.update({
+            'Accept': 'application/vnd.twitchtv.v5+json; charset=UTF-8',
+            'Client-ID': self._CLIENT_ID,
+        })
+        kwargs.update({
+            'headers': headers,
+            'expected_status': (400, 410),
+        })
         response = self._download_json(
-            '%s/%s' % (self._API_BASE, path), item_id, note,
-            headers={'Client-ID': self._CLIENT_ID})
+            '%s/%s' % (self._API_BASE, path), item_id,
+            *args, **compat_kwargs(kwargs))
         self._handle_error(response)
         return response
 
@@ -56,7 +70,7 @@ class TwitchBaseIE(InfoExtractor):
         self._login()
 
     def _login(self):
-        (username, password) = self._get_login_info()
+        username, password = self._get_login_info()
         if username is None:
             return
 
@@ -71,40 +85,49 @@ class TwitchBaseIE(InfoExtractor):
             page_url = urlh.geturl()
             post_url = self._search_regex(
                 r'<form[^>]+action=(["\'])(?P<url>.+?)\1', page,
-                'post url', default=page_url, group='url')
+                'post url', default=self._LOGIN_POST_URL, group='url')
             post_url = urljoin(page_url, post_url)
 
-            headers = {'Referer': page_url}
+            headers = {
+                'Referer': page_url,
+                'Origin': page_url,
+                'Content-Type': 'text/plain;charset=UTF-8',
+            }
 
-            try:
-                response = self._download_json(
-                    post_url, None, note,
-                    data=urlencode_postdata(form),
-                    headers=headers)
-            except ExtractorError as e:
-                if isinstance(e.cause, compat_HTTPError) and e.cause.code == 400:
-                    response = self._parse_json(
-                        e.cause.read().decode('utf-8'), None)
-                    fail(response['message'])
-                raise
+            response = self._download_json(
+                post_url, None, note, data=json.dumps(form).encode(),
+                headers=headers, expected_status=400)
+            error = response.get('error_description') or response.get('error_code')
+            if error:
+                fail(error)
 
-            redirect_url = urljoin(post_url, response['redirect'])
+            if 'Authenticated successfully' in response.get('message', ''):
+                return None, None
+
+            redirect_url = urljoin(
+                post_url,
+                response.get('redirect') or response['redirect_path'])
             return self._download_webpage_handle(
                 redirect_url, None, 'Downloading login redirect page',
                 headers=headers)
 
         login_page, handle = self._download_webpage_handle(
-            self._LOGIN_URL, None, 'Downloading login page')
+            self._LOGIN_FORM_URL, None, 'Downloading login page')
 
         # Some TOR nodes and public proxies are blocked completely
         if 'blacklist_message' in login_page:
             fail(clean_html(login_page))
 
         redirect_page, handle = login_step(
-            login_page, handle, 'Logging in as %s' % username, {
+            login_page, handle, 'Logging in', {
                 'username': username,
                 'password': password,
+                'client_id': self._CLIENT_ID,
             })
+
+        # Successful login
+        if not redirect_page:
+            return
 
         if re.search(r'(?i)<form[^>]+id="two-factor-submit"', redirect_page) is not None:
             # TODO: Add mechanism to request an SMS or phone call
@@ -117,9 +140,14 @@ class TwitchBaseIE(InfoExtractor):
     def _prefer_source(self, formats):
         try:
             source = next(f for f in formats if f['format_id'] == 'Source')
-            source['preference'] = 10
+            source['quality'] = 10
         except StopIteration:
-            pass  # No Source stream present
+            for f in formats:
+                if '/chunked/' in f['url']:
+                    f.update({
+                        'quality': 10,
+                        'format_note': 'Source',
+                    })
         self._sort_formats(formats)
 
 
@@ -159,16 +187,39 @@ class TwitchItemBaseIE(TwitchBaseIE):
         return self.playlist_result(entries, info['id'], info['title'])
 
     def _extract_info(self, info):
+        status = info.get('status')
+        if status == 'recording':
+            is_live = True
+        elif status == 'recorded':
+            is_live = False
+        else:
+            is_live = None
+        _QUALITIES = ('small', 'medium', 'large')
+        quality_key = qualities(_QUALITIES)
+        thumbnails = []
+        preview = info.get('preview')
+        if isinstance(preview, dict):
+            for thumbnail_id, thumbnail_url in preview.items():
+                thumbnail_url = url_or_none(thumbnail_url)
+                if not thumbnail_url:
+                    continue
+                if thumbnail_id not in _QUALITIES:
+                    continue
+                thumbnails.append({
+                    'url': thumbnail_url,
+                    'preference': quality_key(thumbnail_id),
+                })
         return {
             'id': info['_id'],
             'title': info.get('title') or 'Untitled Broadcast',
             'description': info.get('description'),
             'duration': int_or_none(info.get('length')),
-            'thumbnail': info.get('preview'),
+            'thumbnails': thumbnails,
             'uploader': info.get('channel', {}).get('display_name'),
             'uploader_id': info.get('channel', {}).get('name'),
             'timestamp': parse_iso8601(info.get('recorded_at')),
             'view_count': int_or_none(info.get('views')),
+            'is_live': is_live,
         }
 
     def _real_extract(self, url):
@@ -217,8 +268,8 @@ class TwitchVodIE(TwitchItemBaseIE):
     _VALID_URL = r'''(?x)
                     https?://
                         (?:
-                            (?:(?:www|go)\.)?twitch\.tv/(?:[^/]+/v|videos)/|
-                            player\.twitch\.tv/\?.*?\bvideo=v
+                            (?:(?:www|go|m)\.)?twitch\.tv/(?:[^/]+/v(?:ideo)?|videos)/|
+                            player\.twitch\.tv/\?.*?\bvideo=v?
                         )
                         (?P<id>\d+)
                     '''
@@ -270,6 +321,15 @@ class TwitchVodIE(TwitchItemBaseIE):
     }, {
         'url': 'https://www.twitch.tv/videos/6528877',
         'only_matching': True,
+    }, {
+        'url': 'https://m.twitch.tv/beagsandjam/v/247478721',
+        'only_matching': True,
+    }, {
+        'url': 'https://www.twitch.tv/northernlion/video/291940395',
+        'only_matching': True,
+    }, {
+        'url': 'https://player.twitch.tv/?video=480452374',
+        'only_matching': True,
     }]
 
     def _real_extract(self, url):
@@ -281,13 +341,14 @@ class TwitchVodIE(TwitchItemBaseIE):
             'Downloading %s access token' % self._ITEM_TYPE)
 
         formats = self._extract_m3u8_formats(
-            '%s/vod/%s?%s' % (
+            '%s/vod/%s.m3u8?%s' % (
                 self._USHER_BASE, item_id,
                 compat_urllib_parse_urlencode({
                     'allow_source': 'true',
                     'allow_audio_only': 'true',
                     'allow_spectre': 'true',
                     'player': 'twitchweb',
+                    'playlist_include_framerate': 'true',
                     'nauth': access_token['token'],
                     'nauthsig': access_token['sig'],
                 })),
@@ -305,9 +366,8 @@ class TwitchVodIE(TwitchItemBaseIE):
             info['subtitles'] = {
                 'rechat': [{
                     'url': update_url_query(
-                        'https://rechat.twitch.tv/rechat-messages', {
-                            'video_id': 'v%s' % item_id,
-                            'start': info['timestamp'],
+                        'https://api.twitch.tv/v5/videos/%s/comments' % item_id, {
+                            'client_id': self._CLIENT_ID,
                         }),
                     'ext': 'json',
                 }],
@@ -358,8 +418,15 @@ class TwitchPlaylistBaseIE(TwitchBaseIE):
                 break
             offset += limit
         return self.playlist_result(
-            [self.url_result(entry) for entry in orderedSet(entries)],
+            [self._make_url_result(entry) for entry in orderedSet(entries)],
             channel_id, channel_name)
+
+    def _make_url_result(self, url):
+        try:
+            video_id = 'v%s' % TwitchVodIE._match_id(url)
+            return self.url_result(url, TwitchVodIE.ie_key(), video_id=video_id)
+        except AssertionError:
+            return self.url_result(url)
 
     def _extract_playlist_page(self, response):
         videos = response.get('videos')
@@ -374,14 +441,17 @@ class TwitchProfileIE(TwitchPlaylistBaseIE):
     _VALID_URL = r'%s/(?P<id>[^/]+)/profile/?(?:\#.*)?$' % TwitchBaseIE._VALID_URL_BASE
     _PLAYLIST_TYPE = 'profile'
 
-    _TEST = {
+    _TESTS = [{
         'url': 'http://www.twitch.tv/vanillatv/profile',
         'info_dict': {
             'id': 'vanillatv',
             'title': 'VanillaTV',
         },
         'playlist_mincount': 412,
-    }
+    }, {
+        'url': 'http://m.twitch.tv/vanillatv/profile',
+        'only_matching': True,
+    }]
 
 
 class TwitchVideosBaseIE(TwitchPlaylistBaseIE):
@@ -395,14 +465,17 @@ class TwitchAllVideosIE(TwitchVideosBaseIE):
     _PLAYLIST_PATH = TwitchVideosBaseIE._PLAYLIST_PATH + 'archive,upload,highlight'
     _PLAYLIST_TYPE = 'all videos'
 
-    _TEST = {
+    _TESTS = [{
         'url': 'https://www.twitch.tv/spamfish/videos/all',
         'info_dict': {
             'id': 'spamfish',
             'title': 'Spamfish',
         },
         'playlist_mincount': 869,
-    }
+    }, {
+        'url': 'https://m.twitch.tv/spamfish/videos/all',
+        'only_matching': True,
+    }]
 
 
 class TwitchUploadsIE(TwitchVideosBaseIE):
@@ -411,14 +484,17 @@ class TwitchUploadsIE(TwitchVideosBaseIE):
     _PLAYLIST_PATH = TwitchVideosBaseIE._PLAYLIST_PATH + 'upload'
     _PLAYLIST_TYPE = 'uploads'
 
-    _TEST = {
+    _TESTS = [{
         'url': 'https://www.twitch.tv/spamfish/videos/uploads',
         'info_dict': {
             'id': 'spamfish',
             'title': 'Spamfish',
         },
         'playlist_mincount': 0,
-    }
+    }, {
+        'url': 'https://m.twitch.tv/spamfish/videos/uploads',
+        'only_matching': True,
+    }]
 
 
 class TwitchPastBroadcastsIE(TwitchVideosBaseIE):
@@ -427,14 +503,17 @@ class TwitchPastBroadcastsIE(TwitchVideosBaseIE):
     _PLAYLIST_PATH = TwitchVideosBaseIE._PLAYLIST_PATH + 'archive'
     _PLAYLIST_TYPE = 'past broadcasts'
 
-    _TEST = {
+    _TESTS = [{
         'url': 'https://www.twitch.tv/spamfish/videos/past-broadcasts',
         'info_dict': {
             'id': 'spamfish',
             'title': 'Spamfish',
         },
         'playlist_mincount': 0,
-    }
+    }, {
+        'url': 'https://m.twitch.tv/spamfish/videos/past-broadcasts',
+        'only_matching': True,
+    }]
 
 
 class TwitchHighlightsIE(TwitchVideosBaseIE):
@@ -443,14 +522,17 @@ class TwitchHighlightsIE(TwitchVideosBaseIE):
     _PLAYLIST_PATH = TwitchVideosBaseIE._PLAYLIST_PATH + 'highlight'
     _PLAYLIST_TYPE = 'highlights'
 
-    _TEST = {
+    _TESTS = [{
         'url': 'https://www.twitch.tv/spamfish/videos/highlights',
         'info_dict': {
             'id': 'spamfish',
             'title': 'Spamfish',
         },
         'playlist_mincount': 805,
-    }
+    }, {
+        'url': 'https://m.twitch.tv/spamfish/videos/highlights',
+        'only_matching': True,
+    }]
 
 
 class TwitchStreamIE(TwitchBaseIE):
@@ -458,7 +540,7 @@ class TwitchStreamIE(TwitchBaseIE):
     _VALID_URL = r'''(?x)
                     https?://
                         (?:
-                            (?:(?:www|go)\.)?twitch\.tv/|
+                            (?:(?:www|go|m)\.)?twitch\.tv/|
                             player\.twitch\.tv/\?.*?\bchannel=
                         )
                         (?P<id>[^/#?]+)
@@ -492,6 +574,9 @@ class TwitchStreamIE(TwitchBaseIE):
     }, {
         'url': 'https://go.twitch.tv/food',
         'only_matching': True,
+    }, {
+        'url': 'https://m.twitch.tv/food',
+        'only_matching': True,
     }]
 
     @classmethod
@@ -505,15 +590,24 @@ class TwitchStreamIE(TwitchBaseIE):
                     TwitchAllVideosIE,
                     TwitchUploadsIE,
                     TwitchPastBroadcastsIE,
-                    TwitchHighlightsIE))
+                    TwitchHighlightsIE,
+                    TwitchClipsIE))
                 else super(TwitchStreamIE, cls).suitable(url))
 
     def _real_extract(self, url):
-        channel_id = self._match_id(url)
+        channel_name = self._match_id(url)
+
+        access_token = self._call_api(
+            'api/channels/%s/access_token' % channel_name, channel_name,
+            'Downloading access token JSON')
+
+        token = access_token['token']
+        channel_id = compat_str(self._parse_json(
+            token, channel_name)['channel_id'])
 
         stream = self._call_api(
-            'kraken/streams/%s?stream_type=all' % channel_id, channel_id,
-            'Downloading stream JSON').get('stream')
+            'kraken/streams/%s?stream_type=all' % channel_id,
+            channel_id, 'Downloading stream JSON').get('stream')
 
         if not stream:
             raise ExtractorError('%s is offline' % channel_id, expected=True)
@@ -522,11 +616,9 @@ class TwitchStreamIE(TwitchBaseIE):
         # (e.g. http://www.twitch.tv/TWITCHPLAYSPOKEMON) that will lead to constructing
         # an invalid m3u8 URL. Working around by use of original channel name from stream
         # JSON and fallback to lowercase if it's not available.
-        channel_id = stream.get('channel', {}).get('name') or channel_id.lower()
-
-        access_token = self._call_api(
-            'api/channels/%s/access_token' % channel_id, channel_id,
-            'Downloading channel access token')
+        channel_name = try_get(
+            stream, lambda x: x['channel']['name'],
+            compat_str) or channel_name.lower()
 
         query = {
             'allow_source': 'true',
@@ -534,13 +626,14 @@ class TwitchStreamIE(TwitchBaseIE):
             'allow_spectre': 'true',
             'p': random.randint(1000000, 10000000),
             'player': 'twitchweb',
+            'playlist_include_framerate': 'true',
             'segment_preference': '4',
             'sig': access_token['sig'].encode('utf-8'),
-            'token': access_token['token'].encode('utf-8'),
+            'token': token.encode('utf-8'),
         }
         formats = self._extract_m3u8_formats(
             '%s/api/channel/hls/%s.m3u8?%s'
-            % (self._USHER_BASE, channel_id, compat_urllib_parse_urlencode(query)),
+            % (self._USHER_BASE, channel_name, compat_urllib_parse_urlencode(query)),
             channel_id, 'mp4')
         self._prefer_source(formats)
 
@@ -563,8 +656,8 @@ class TwitchStreamIE(TwitchBaseIE):
             })
 
         return {
-            'id': compat_str(stream['_id']),
-            'display_id': channel_id,
+            'id': str_or_none(stream.get('_id')) or channel_id,
+            'display_id': channel_name,
             'title': title,
             'description': description,
             'thumbnails': thumbnails,
@@ -577,59 +670,127 @@ class TwitchStreamIE(TwitchBaseIE):
         }
 
 
-class TwitchClipsIE(InfoExtractor):
+class TwitchClipsIE(TwitchBaseIE):
     IE_NAME = 'twitch:clips'
-    _VALID_URL = r'https?://clips\.twitch\.tv/(?:[^/]+/)*(?P<id>[^/?#&]+)'
+    _VALID_URL = r'''(?x)
+                    https?://
+                        (?:
+                            clips\.twitch\.tv/(?:embed\?.*?\bclip=|(?:[^/]+/)*)|
+                            (?:(?:www|go|m)\.)?twitch\.tv/[^/]+/clip/
+                        )
+                        (?P<id>[^/?#&]+)
+                    '''
 
     _TESTS = [{
-        'url': 'https://clips.twitch.tv/ea/AggressiveCobraPoooound',
+        'url': 'https://clips.twitch.tv/FaintLightGullWholeWheat',
         'md5': '761769e1eafce0ffebfb4089cb3847cd',
         'info_dict': {
-            'id': 'AggressiveCobraPoooound',
+            'id': '42850523',
             'ext': 'mp4',
             'title': 'EA Play 2016 Live from the Novo Theatre',
             'thumbnail': r're:^https?://.*\.jpg',
+            'timestamp': 1465767393,
+            'upload_date': '20160612',
             'creator': 'EA',
             'uploader': 'stereotype_',
-            'uploader_id': 'stereotype_',
+            'uploader_id': '43566419',
         },
     }, {
         # multiple formats
         'url': 'https://clips.twitch.tv/rflegendary/UninterestedBeeDAESuppy',
+        'only_matching': True,
+    }, {
+        'url': 'https://www.twitch.tv/sergeynixon/clip/StormyThankfulSproutFutureMan',
+        'only_matching': True,
+    }, {
+        'url': 'https://clips.twitch.tv/embed?clip=InquisitiveBreakableYogurtJebaited',
+        'only_matching': True,
+    }, {
+        'url': 'https://m.twitch.tv/rossbroadcast/clip/ConfidentBraveHumanChefFrank',
+        'only_matching': True,
+    }, {
+        'url': 'https://go.twitch.tv/rossbroadcast/clip/ConfidentBraveHumanChefFrank',
         'only_matching': True,
     }]
 
     def _real_extract(self, url):
         video_id = self._match_id(url)
 
-        webpage = self._download_webpage(url, video_id)
+        clip = self._download_json(
+            'https://gql.twitch.tv/gql', video_id, data=json.dumps({
+                'query': '''{
+  clip(slug: "%s") {
+    broadcaster {
+      displayName
+    }
+    createdAt
+    curator {
+      displayName
+      id
+    }
+    durationSeconds
+    id
+    tiny: thumbnailURL(width: 86, height: 45)
+    small: thumbnailURL(width: 260, height: 147)
+    medium: thumbnailURL(width: 480, height: 272)
+    title
+    videoQualities {
+      frameRate
+      quality
+      sourceURL
+    }
+    viewCount
+  }
+}''' % video_id,
+            }).encode(), headers={
+                'Client-ID': self._CLIENT_ID,
+            })['data']['clip']
 
-        clip = self._parse_json(
-            self._search_regex(
-                r'(?s)clipInfo\s*=\s*({.+?});', webpage, 'clip info'),
-            video_id, transform_source=js_to_json)
+        if not clip:
+            raise ExtractorError(
+                'This clip is no longer available', expected=True)
 
-        title = clip.get('channel_title') or self._og_search_title(webpage)
-
-        formats = [{
-            'url': option['source'],
-            'format_id': option.get('quality'),
-            'height': int_or_none(option.get('quality')),
-        } for option in clip.get('quality_options', []) if option.get('source')]
-
-        if not formats:
-            formats = [{
-                'url': clip['clip_video_url'],
-            }]
-
+        formats = []
+        for option in clip.get('videoQualities', []):
+            if not isinstance(option, dict):
+                continue
+            source = url_or_none(option.get('sourceURL'))
+            if not source:
+                continue
+            formats.append({
+                'url': source,
+                'format_id': option.get('quality'),
+                'height': int_or_none(option.get('quality')),
+                'fps': int_or_none(option.get('frameRate')),
+            })
         self._sort_formats(formats)
 
+        thumbnails = []
+        for thumbnail_id in ('tiny', 'small', 'medium'):
+            thumbnail_url = clip.get(thumbnail_id)
+            if not thumbnail_url:
+                continue
+            thumb = {
+                'id': thumbnail_id,
+                'url': thumbnail_url,
+            }
+            mobj = re.search(r'-(\d+)x(\d+)\.', thumbnail_url)
+            if mobj:
+                thumb.update({
+                    'height': int(mobj.group(2)),
+                    'width': int(mobj.group(1)),
+                })
+            thumbnails.append(thumb)
+
         return {
-            'id': video_id,
-            'title': title,
-            'thumbnail': self._og_search_thumbnail(webpage),
-            'creator': clip.get('broadcaster_display_name') or clip.get('broadcaster_login'),
-            'uploader': clip.get('curator_login'),
-            'uploader_id': clip.get('curator_display_name'),
+            'id': clip.get('id') or video_id,
+            'title': clip.get('title') or video_id,
             'formats': formats,
+            'duration': int_or_none(clip.get('durationSeconds')),
+            'views': int_or_none(clip.get('viewCount')),
+            'timestamp': unified_timestamp(clip.get('createdAt')),
+            'thumbnails': thumbnails,
+            'creator': try_get(clip, lambda x: x['broadcaster']['displayName'], compat_str),
+            'uploader': try_get(clip, lambda x: x['curator']['displayName'], compat_str),
+            'uploader_id': try_get(clip, lambda x: x['curator']['id'], compat_str),
         }
